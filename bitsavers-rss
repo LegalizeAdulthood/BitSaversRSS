@@ -1,0 +1,215 @@
+#!/usr/bin/perl -w
+
+use HTTP::Date;
+use HTTP::Request;
+use HTTP::Response;
+use LWP::UserAgent;
+use XML::RSS;
+
+use POSIX qw(strftime);
+
+sub createUserAgent()
+{
+	my $agent = LWP::UserAgent->new;
+	$agent->agent("bitsavers-rss/1.0");
+	$agent->timeout(5);
+	# $agent->agent("Mozilla/8.0") # pretend we are very capable browser
+	return $agent;
+}
+my $ua = createUserAgent();
+
+sub get($)
+{
+	my $response = $ua->get(shift);
+	return $response->is_success ?
+		$response->decoded_content : undef;
+}
+
+sub head($)
+{
+	my($url) = @_;
+	my $req = HTTP::Request->new(HEAD => $url);
+	$req->header('Accept' => '*/*');
+
+	# send request
+	my $response = $ua->request($req);
+
+	# check the outcome
+	if ($response->is_success)
+	{
+		return (scalar $response->header('Content-Type'),
+			scalar $response->header('Content-Length'),
+			HTTP::Date::str2time($response->header('Last-Modified')),
+			HTTP::Date::str2time($response->header('Expires')),
+			scalar $response->header('Server'));
+	}
+	else
+	{
+		return ();
+	}
+}
+
+sub mirrorUrlFromBitSaversUrl($)
+{
+	my($url) = @_;
+	$url =~ s/bitsavers\.org/bitsavers.trailing-edge.com/;
+	return $url;
+}
+
+sub rfc822Date($)
+{
+	my($date) = @_;
+
+	# We need to munge the timezone indicator to add a colon between the
+	# hour and minute part
+	my $tz = strftime("%z", localtime($date));
+	$tz =~ s/(\d{2})(\d{2})/$1:$2/;
+
+	# RFC822 (actually RFC2822, as the year has 4 digits)
+	return strftime("%a, %d %b %Y %H:%M:%S %z", localtime($date));
+}
+
+sub rfc822Now()
+{
+	return rfc822Date(time());
+}
+
+sub createRSS($)
+{
+	my($tag) = @_;
+	my $now = rfc822Now();
+	my $style_sheet = 'rss.xsl';
+	my $rss = new XML::RSS(version => '2.0', stylesheet=>$style_sheet);
+	my $file_type = ($tag eq 'pdf') ? 'documents' : 'disk/tape images';
+	$rss->channel(title => "bitsavers.org $tag",
+		link => "http://www.bitsavers.org/$tag",
+		language => 'en',
+		description => "New $file_type on bitsavers.org",
+		rating =>
+			'(PICS-1.1 "http://www.classify.org/safesurf/" 1 r (SS~~000 1))',
+		copyright => 'Copyright 2007-2010, Pahvant Technologies Inc.',
+		pubDate => $now,
+		lastBuildDate => $now,
+		managingEditor => 'legalize@xmission.com',
+		webMaster => 'legalize@xmission.com');
+	return $rss;
+}
+
+sub getItems($$)
+{
+	my($base, $whatsNew) = @_;
+	local($_);
+	my $whatsnew = get($whatsNew) || die "Couldn't fetch ${whatsNew}";
+	my(@items);
+
+	foreach (split /\n/, $whatsnew)
+	{
+		if (length > 0)
+		{
+			my($date, $time, $file) = split / /, $_;
+			my($url) = "$base$file";
+			$url =~ s/([%#&])/sprintf("%%%02x", ord($1))/eg;
+			push @items, [ $url, $file ];
+		}
+	}
+	return @items;
+}
+
+sub urlFolderForFile($$)
+{
+	my($url, $file) = @_;
+	my @urlParts = split /\//, $url;
+	my @fileParts = split /\//, $file;
+	my $count = scalar(@urlParts) - scalar(@fileParts) - 1;
+	return join('/', @urlParts[0 .. $count]);
+}
+
+sub itemDescription($$$)
+{
+	my($url, $file, $title) = @_;
+	my $folder = urlFolderForFile($url, $file);
+	local($_);
+	my(@folders) = split(' :: ', $title);
+	my(@paths) = split('/', $file);
+	$file = pop(@folders);
+	pop(@paths);
+	my $folderLinks = '';
+	$folder =~ s/\/$//o;
+	my($i);
+	for ($i = 0; $i < scalar(@folders); ++$i)
+	{
+		$folder .= "/$paths[$i]";
+		$folderLinks .= sprintf('<a href="%s">%s</a> :: ',
+			$folder, $folders[$i]);
+	}
+	$folderLinks .= sprintf('<a href="%s">%s</a>', $url, $file);
+	return '<![CDATA[' . $folderLinks . ']]>';
+}
+
+sub itemCategory($)
+{
+	my($file) = @_;
+	return (split('/', $file))[0];
+}
+
+sub itemTitle($$)
+{
+	my($file, $tag) = @_;
+	my @path = split('/', $file);
+	my $title = join(' :: ', @path);
+	if ($tag eq 'pdf')
+	{
+		$title =~ s/\.pdf//i;
+	}
+	$title =~ s/_/ /g;
+	return $title;
+}
+
+sub addItem($$$)
+{
+	my($rss, $item, $tag) = @_;
+	my($url, $file) = @$item;
+	$url = mirrorUrlFromBitSaversUrl($url);
+	my($contentType, $contentLength, $modifiedDate) = (head($url))[0, 1, 2];
+	return unless defined $contentType
+		and defined $contentLength
+		and defined $modifiedDate;
+	my $title = itemTitle($file, $tag);
+	$rss->add_item(title => $title,
+		permaLink => $url,
+		enclosure =>
+		{
+			url => $url,
+			length => $contentLength,
+			type => $contentType
+		},
+		description => itemDescription($url, $file, $title),
+		category => itemCategory($file),
+		pubDate => rfc822Date($modifiedDate));
+}
+
+sub main()
+{
+	my $tag = $ARGV[0];
+	my $max_item_count = 250;
+	my $base = "http://bitsavers.org/$tag/";
+	my $whatsNew = mirrorUrlFromBitSaversUrl(
+		"http://bitsavers.org/$tag/IndexByDate.txt");
+	my(@items) = getItems($base, $whatsNew);
+	my $rss = createRSS($tag);
+
+	my $count = 0;
+	foreach (@items)
+	{
+		$count++;
+		addItem($rss, $_, $tag);
+		if ($count > $max_item_count)
+		{
+			last;
+		}
+	}
+
+	print $rss->as_string;
+}
+
+main;
